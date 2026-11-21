@@ -1,0 +1,125 @@
+name: Build Alte OPlus Tweaker APK
+
+# Закинь ZIP с проектом в репозиторий (корень или любая папка) -> Actions сам
+# распакует его, соберёт подписанный APK и положит в Releases (история сборок) и Artifacts.
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: Alte_OPlus_Tweaker
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Найти и распаковать ZIP
+        id: unpack
+        shell: bash
+        run: |
+          set -e
+          rm -rf _project
+          mkdir -p _project
+
+          # самый свежий (по коммиту) ZIP в репозитории
+          BEST=""; BT=0
+          while IFS= read -r f; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            t=${t:-0}
+            if [ "$t" -ge "$BT" ]; then BT=$t; BEST=$f; fi
+          done < <(find . -maxdepth 4 -iname '*.zip' -not -path './_project/*' -not -path './.git/*')
+
+          if [ -n "$BEST" ]; then
+            echo "Распаковываю: $BEST"
+            unzip -q -o "$BEST" -d _project || [ $? -eq 1 ]
+          elif [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+            echo "ZIP не найден — использую проект из репозитория как есть"
+            rsync -a --exclude=_project --exclude=.git ./ _project/
+          else
+            echo "::error::В репозитории нет ZIP с проектом и нет settings.gradle(.kts)"
+            exit 1
+          fi
+
+          SETTINGS=$(find _project -maxdepth 5 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | head -n1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Внутри ZIP не найден settings.gradle(.kts)"
+            exit 1
+          fi
+          ROOT=$(dirname "$SETTINGS")
+          echo "Корень проекта: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Сборка APK
+        shell: bash
+        working-directory: ${{ steps.unpack.outputs.root }}
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            G=./gradlew
+          else
+            G=gradle
+          fi
+          $G --no-daemon --stacktrace assembleRelease || $G --no-daemon --stacktrace assembleDebug
+
+      - name: Подготовить APK
+        id: apk
+        shell: bash
+        run: |
+          APK=$(find "${{ steps.unpack.outputs.root }}" -path '*outputs/apk/release/*.apk' | head -n1)
+          [ -n "$APK" ] || APK=$(find "${{ steps.unpack.outputs.root }}" -path '*outputs/apk/debug/*.apk' | head -n1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK не найден после сборки"
+            exit 1
+          fi
+          mkdir -p dist
+          NAME="${APP_NAME}_build${{ github.run_number }}.apk"
+          cp "$APK" "dist/$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}_build${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Release (история APK)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ${{ env.APP_NAME }} build ${{ github.run_number }}
+          files: dist/*.apk
+          make_latest: true
